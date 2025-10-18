@@ -26,7 +26,6 @@ from typing import (
 )
 
 import mlx.core as mx
-import mlx.nn as nn
 from huggingface_hub import scan_cache_dir
 
 from ._version import __version__
