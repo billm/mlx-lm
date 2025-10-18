@@ -565,5 +565,123 @@ class TestKeepalive(unittest.TestCase):
             self.fail(f"Callback should handle BrokenPipeError: {e}")
 
 
+class TestBatchedServer(unittest.TestCase):
+    """Tests for batched server mode."""
+
+    @classmethod
+    def setUpClass(cls):
+        from mlx_lm.server import BatchWorker
+        from mlx_lm.sample_utils import make_sampler
+
+        cls.model_provider = DummyModelProvider()
+        model, tokenizer = cls.model_provider.load("default_model")
+
+        # Create a batch worker
+        sampler = make_sampler(temp=0.0)
+        cls.batch_worker = BatchWorker(
+            model=model,
+            tokenizer=tokenizer,
+            sampler=sampler,
+            completion_batch_size=4,
+            prefill_batch_size=2,
+            prefill_step_size=512,
+        )
+        cls.batch_worker.start()
+
+        cls.server_address = ("localhost", 0)
+        cls.httpd = http.server.HTTPServer(
+            cls.server_address,
+            lambda *args, **kwargs: APIHandler(
+                cls.model_provider, batch_worker=cls.batch_worker, *args, **kwargs
+            ),
+        )
+        cls.port = cls.httpd.server_port
+        cls.server_thread = threading.Thread(target=cls.httpd.serve_forever)
+        cls.server_thread.daemon = True
+        cls.server_thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.batch_worker.stop()
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+        cls.server_thread.join()
+
+    def test_batched_completion(self):
+        """Test basic batched completion."""
+        url = f"http://localhost:{self.port}/v1/completions"
+
+        post_data = {
+            "model": "default_model",
+            "prompt": "Once upon a time",
+            "max_tokens": 5,
+            "temperature": 0.0,
+        }
+
+        response = requests.post(url, json=post_data)
+        self.assertEqual(response.status_code, 200)
+
+        response_body = json.loads(response.text)
+        self.assertIn("id", response_body)
+        self.assertIn("choices", response_body)
+        self.assertIn("text", response_body["choices"][0])
+        self.assertGreater(len(response_body["choices"][0]["text"]), 0)
+
+    def test_batched_streaming(self):
+        """Test streaming with batched mode."""
+        url = f"http://localhost:{self.port}/v1/chat/completions"
+
+        post_data = {
+            "model": "default_model",
+            "max_tokens": 5,
+            "temperature": 0.0,
+            "stream": True,
+            "messages": [
+                {"role": "user", "content": "Hello!"},
+            ],
+        }
+
+        response = requests.post(url, json=post_data, stream=True)
+        self.assertEqual(response.status_code, 200)
+
+        chunk_count = 0
+        for chunk in response.iter_lines():
+            if chunk:
+                data = chunk.decode("utf-8")
+                if data.startswith("data: ") and data != "data: [DONE]":
+                    chunk_data = json.loads(data[6:])
+                    self.assertIn("choices", chunk_data)
+                    chunk_count += 1
+
+        self.assertGreater(chunk_count, 0)
+
+    def test_concurrent_requests(self):
+        """Test that multiple concurrent requests are handled properly."""
+        import concurrent.futures
+
+        url = f"http://localhost:{self.port}/v1/completions"
+
+        def make_request(prompt_suffix):
+            post_data = {
+                "model": "default_model",
+                "prompt": f"Test prompt {prompt_suffix}",
+                "max_tokens": 5,
+                "temperature": 0.0,
+            }
+            response = requests.post(url, json=post_data)
+            return response.status_code, json.loads(response.text)
+
+        # Make 3 concurrent requests
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+            futures = [executor.submit(make_request, i) for i in range(3)]
+            results = [f.result() for f in futures]
+
+        # All should succeed
+        for status, body in results:
+            self.assertEqual(status, 200)
+            self.assertIn("choices", body)
+            self.assertGreater(len(body["choices"][0]["text"]), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -352,6 +352,101 @@ class TestGenerate(unittest.TestCase):
 
         del self.model.make_cache
 
+    def test_batch_cancel(self):
+        """Test that cancel() properly removes requests from the batch."""
+        prompts = [
+            "Write a story about Einstein",
+            "Hi",
+            "What time is it?",
+            "How tall is Mt Everest?",
+        ]
+        prompts = [
+            self.tokenizer.apply_chat_template(
+                [{"role": "user", "content": p}],
+                tokenize=True,
+                add_generation_prompt=True,
+            )
+            for p in prompts
+        ]
+
+        gen = BatchGenerator(
+            self.model,
+            stop_tokens=self.tokenizer.eos_token_ids,
+            max_tokens=10,
+            prefill_batch_size=2,
+            prefill_step_size=8,
+            completion_batch_size=4,
+        )
+        uids = gen.insert(prompts)
+
+        # Cancel first two requests before any processing
+        gen.cancel([uids[0], uids[1]])
+
+        # Process first batch
+        responses = gen.next()
+
+        # Should only get responses for the non-canceled requests
+        response_uids = [r.uid for r in responses]
+        self.assertNotIn(uids[0], response_uids)
+        self.assertNotIn(uids[1], response_uids)
+
+        # Continue processing until all done
+        all_responses = {uid: [] for uid in uids[2:]}
+        while responses:
+            for r in responses:
+                if r.uid in all_responses:
+                    all_responses[r.uid].append(r.token)
+            responses = gen.next()
+
+        # Verify we got responses for all non-canceled requests
+        for uid in uids[2:]:
+            self.assertGreater(len(all_responses[uid]), 0)
+
+    def test_batch_cancel_active(self):
+        """Test that cancel() properly removes requests from active batch."""
+        prompts = [
+            "Write a story about Einstein",
+            "Hi",
+            "What time is it?",
+        ]
+        prompts = [
+            self.tokenizer.apply_chat_template(
+                [{"role": "user", "content": p}],
+                tokenize=True,
+                add_generation_prompt=True,
+            )
+            for p in prompts
+        ]
+
+        gen = BatchGenerator(
+            self.model,
+            stop_tokens=self.tokenizer.eos_token_ids,
+            max_tokens=10,
+            prefill_batch_size=3,
+            prefill_step_size=8,
+            completion_batch_size=3,
+        )
+        uids = gen.insert(prompts)
+
+        # Get first token for all requests
+        responses = gen.next()
+        self.assertEqual(len(responses), 3)
+
+        # Cancel the middle request
+        gen.cancel([uids[1]])
+
+        # Continue and verify we only get responses for the non-canceled requests
+        all_responses = {uid: [] for uid in [uids[0], uids[2]]}
+        while responses := gen.next():
+            for r in responses:
+                self.assertNotEqual(r.uid, uids[1])  # Should never see canceled uid
+                if r.uid in all_responses:
+                    all_responses[r.uid].append(r.token)
+
+        # Verify we got responses for the non-canceled requests
+        self.assertGreater(len(all_responses[uids[0]]), 0)
+        self.assertGreater(len(all_responses[uids[2]]), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

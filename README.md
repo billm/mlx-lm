@@ -12,6 +12,7 @@ Some key features include:
   fine-tuning](https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/LORA.md)
   with support for quantized models.
 * Distributed inference and fine-tuning with `mx.distributed`
+* OpenAI-compatible HTTP server with support for pipelined batching for improved throughput
 
 The easiest way to get started is to install the `mlx-lm` package:
 
@@ -57,6 +58,27 @@ The default model for generation and chat is
 model with the `--model` flag. Thousands are available in the
 [MLX Community](https://huggingface.co/mlx-community) Hugging Face
 organization.
+
+#### HTTP Server
+
+MLX LM includes an OpenAI-compatible HTTP server for serving LLMs:
+
+```bash
+mlx_lm.server --model mlx-community/Llama-3.2-3B-Instruct-4bit
+```
+
+The server supports standard `/v1/completions` and `/v1/chat/completions` endpoints
+and can be used with any OpenAI-compatible client.
+
+For improved throughput with multiple concurrent requests, enable batched mode:
+
+```bash
+mlx_lm.server --model mlx-community/Llama-3.2-3B-Instruct-4bit --batched
+```
+
+See [BATCHED_SERVING.md](https://github.com/ml-explore/mlx-lm/blob/main/BATCHED_SERVING.md)
+for detailed information about the batched serving mode, including configuration
+options and performance tuning.
 
 ### Python API
 

@@ -914,6 +914,7 @@ class BatchGenerator:
         self._stats = BatchStats()
 
         self.active_batch = None
+        self._canceled = set()
 
     def insert(self, prompts, max_tokens: Union[List[int], int, None] = None):
         uids = []
@@ -930,6 +931,30 @@ class BatchGenerator:
             self.unprocessed_prompts, key=lambda x: len(x[1])
         )
         return uids
+
+    def cancel(self, uids: List[int]):
+        """
+        Cancel generation for specific uids.
+
+        Args:
+            uids (List[int]): List of unique identifiers to cancel.
+        """
+        self._canceled.update(uids)
+        # Remove from unprocessed prompts
+        self.unprocessed_prompts = [
+            t for t in self.unprocessed_prompts if t[0] not in self._canceled
+        ]
+        # Remove from active batch if present
+        if self.active_batch is not None:
+            keep_idx = [
+                i
+                for i, uid in enumerate(self.active_batch.uids)
+                if uid not in self._canceled
+            ]
+            if keep_idx:
+                self.active_batch.filter(keep_idx)
+            else:
+                self.active_batch = None
 
     def _process_prompts(self, prompts):
         uids, inputs, max_tokens = zip(*prompts)
@@ -1027,6 +1052,11 @@ class BatchGenerator:
         ):
             num_tok += 1
             batch.num_tokens[e] = num_tok
+            # Check if this uid was canceled
+            if uid in self._canceled:
+                end_idx.append(e)
+                # Don't send a response for canceled requests
+                continue
             if t in self.stop_tokens:
                 finish_reason = "stop"
                 end_idx.append(e)
@@ -1037,6 +1067,9 @@ class BatchGenerator:
                 finish_reason = None
                 keep_idx.append(e)
             responses.append(self.Response(uid, t, logprobs[e], finish_reason))
+
+        # Clear canceled uids that have been processed
+        self._canceled.difference_update([batch.uids[i] for i in end_idx])
 
         # Remove any finished completions
         if len(end_idx):
