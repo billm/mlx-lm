@@ -4,7 +4,9 @@ import argparse
 import json
 import logging
 import platform
+import queue
 import socket
+import threading
 import time
 import uuid
 import warnings
@@ -24,10 +26,11 @@ from typing import (
 )
 
 import mlx.core as mx
+import mlx.nn as nn
 from huggingface_hub import scan_cache_dir
 
 from ._version import __version__
-from .generate import stream_generate
+from .generate import BatchGenerator, stream_generate, generation_stream, wired_limit
 from .models.cache import can_trim_prompt_cache, make_prompt_cache, trim_prompt_cache
 from .sample_utils import make_logits_processors, make_sampler
 from .utils import common_prefix_len, load
@@ -152,6 +155,117 @@ class PromptCache:
     tokens: List[int] = field(default_factory=list)
 
 
+@dataclass
+class ClientContext:
+    """Context for a single client request in batched mode."""
+
+    token_queue: queue.Queue = field(default_factory=queue.Queue)
+    finished: threading.Event = field(default_factory=threading.Event)
+    finish_reason: Optional[str] = None
+
+
+class BatchWorker(threading.Thread):
+    """
+    Worker thread that owns a BatchGenerator and processes multiple requests
+    concurrently using pipelined batching.
+    """
+
+    def __init__(
+        self,
+        model,
+        tokenizer,
+        sampler,
+        completion_batch_size: int,
+        prefill_batch_size: int,
+        prefill_step_size: int,
+    ):
+        super().__init__(daemon=True)
+        self.model = model
+        self.tokenizer = tokenizer
+        self.gen = BatchGenerator(
+            model=model,
+            stop_tokens=tokenizer.eos_token_ids,
+            sampler=sampler,
+            completion_batch_size=completion_batch_size,
+            prefill_batch_size=prefill_batch_size,
+            prefill_step_size=prefill_step_size,
+        )
+        self.uid_to_ctx: Dict[int, ClientContext] = {}
+        self.lock = threading.Lock()
+        self.running = True
+
+    def submit(
+        self, prompt_ids: List[int], max_tokens: int, ctx: ClientContext
+    ) -> int:
+        """
+        Submit a new request to the batch generator.
+
+        Args:
+            prompt_ids: Tokenized prompt
+            max_tokens: Maximum tokens to generate for this request
+            ctx: Client context for this request
+
+        Returns:
+            uid: Unique identifier for this request
+        """
+        with self.lock:
+            uids = self.gen.insert([prompt_ids], max_tokens)
+            uid = uids[0]
+            self.uid_to_ctx[uid] = ctx
+        return uid
+
+    def cancel(self, uid: int):
+        """
+        Cancel a specific request.
+
+        Args:
+            uid: Unique identifier of the request to cancel
+        """
+        with self.lock:
+            self.gen.cancel([uid])
+            if uid in self.uid_to_ctx:
+                del self.uid_to_ctx[uid]
+
+    def stop(self):
+        """Stop the worker thread."""
+        self.running = False
+
+    def run(self):
+        """Main loop that processes batches and dispatches tokens."""
+        with wired_limit(self.model, [generation_stream]):
+            while self.running:
+                try:
+                    with self.lock:
+                        responses = self.gen.next()
+
+                    if not responses:
+                        # No active work, sleep briefly
+                        time.sleep(0.001)
+                        continue
+
+                    for r in responses:
+                        ctx = self.uid_to_ctx.get(r.uid)
+                        if ctx is None:
+                            # Request was canceled or doesn't exist
+                            continue
+
+                        if r.finish_reason is None:
+                            # Token generated, queue it
+                            ctx.token_queue.put((r.token, r.logprobs))
+                        else:
+                            # Request finished
+                            ctx.finish_reason = r.finish_reason
+                            ctx.finished.set()
+                            # Clean up
+                            with self.lock:
+                                if r.uid in self.uid_to_ctx:
+                                    del self.uid_to_ctx[r.uid]
+
+                except Exception as e:
+                    logging.error(f"BatchWorker error: {e}", exc_info=True)
+                    # Continue running even if there's an error
+
+
 class ModelProvider:
     def __init__(self, cli_args: argparse.Namespace):
         """Load models on demand and persist them across the whole process."""
@@ -241,6 +355,7 @@ class APIHandler(BaseHTTPRequestHandler):
         *args,
         prompt_cache: Optional[PromptCache] = None,
         system_fingerprint: Optional[str] = None,
+        batch_worker: Optional[BatchWorker] = None,
         **kwargs,
     ):
         """
@@ -250,6 +365,7 @@ class APIHandler(BaseHTTPRequestHandler):
         self.model_provider = model_provider
         self.prompt_cache = prompt_cache or PromptCache()
         self.system_fingerprint = system_fingerprint or get_system_fingerprint()
+        self.batch_worker = batch_worker
         super().__init__(*args, **kwargs)
 
     def _set_cors_headers(self):
@@ -642,6 +758,10 @@ class APIHandler(BaseHTTPRequestHandler):
             stop_id_sequences (List[List[int]]): A list of stop words passed
               to the stopping_criteria function
         """
+        # Use batched mode if available
+        if self.batch_worker is not None:
+            return self.handle_batched_completion(prompt, stop_id_sequences)
+
         tokens = []
         finish_reason = "length"
         stop_sequence_suffix = None
@@ -816,6 +936,158 @@ class APIHandler(BaseHTTPRequestHandler):
             self.wfile.write(response_json)
             self.wfile.flush()
 
+    def handle_batched_completion(
+        self,
+        prompt: List[int],
+        stop_id_sequences: List[List[int]],
+    ):
+        """
+        Generate a response using the batch worker.
+
+        Args:
+            prompt (List[int]): The tokenized prompt.
+            stop_id_sequences (List[List[int]]): A list of stop words passed
+              to the stopping_criteria function
+        """
+        tokens = []
+        finish_reason = "length"
+
+        if self.stream:
+            self.end_headers()
+            logging.debug(f"Starting batched stream:")
+        else:
+            logging.debug(f"Starting batched completion:")
+
+        token_logprobs = []
+        top_tokens = []
+        text = ""
+        segment = ""
+        tool_calls = []
+        tool_text = ""
+        in_tool_call = False
+
+        # Create client context and submit to batch worker
+        ctx = ClientContext()
+        uid = self.batch_worker.submit(prompt, self.max_tokens, ctx)
+
+        try:
+            # Process tokens as they arrive
+            while not ctx.finished.is_set():
+                try:
+                    # Wait for a token with timeout to check finished flag
+                    token, logprobs = ctx.token_queue.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+
+                tokens.append(token)
+
+                # Decode the token
+                detokenized = self.tokenizer.decode([token])
+
+                if (
+                    self.tokenizer.has_tool_calling
+                    and detokenized == self.tokenizer.tool_call_start
+                ):
+                    in_tool_call = True
+                elif in_tool_call:
+                    if detokenized == self.tokenizer.tool_call_end:
+                        tool_calls.append(tool_text)
+                        tool_text = ""
+                        in_tool_call = False
+                    else:
+                        tool_text += detokenized
+                else:
+                    text += detokenized
+                    segment += detokenized
+
+                if self.logprobs > 0:
+                    sorted_indices = mx.argpartition(-logprobs, kth=self.logprobs - 1)
+                    top_indices = sorted_indices[: self.logprobs]
+                    top_logprobs = logprobs[top_indices]
+                    top_token_info = zip(top_indices.tolist(), top_logprobs.tolist())
+                    top_tokens.append(tuple(top_token_info))
+
+                token_logprobs.append(logprobs[token].item())
+
+                # Check for stop sequences
+                stop_condition = stopping_criteria(
+                    tokens, stop_id_sequences, self.tokenizer.eos_token_id
+                )
+                if stop_condition.stop_met:
+                    finish_reason = "stop"
+                    if stop_condition.trim_length:
+                        stop_sequence_suffix = self.tokenizer.decode(
+                            tokens[-stop_condition.trim_length :]
+                        )
+                        text = text[: -len(stop_sequence_suffix)]
+                        segment = segment[: -len(stop_sequence_suffix)]
+                    # Cancel the request in the worker
+                    self.batch_worker.cancel(uid)
+                    break
+
+                # Send streaming response
+                if self.stream and not in_tool_call:
+                    # If the end of tokens overlaps with a stop sequence, wait for more tokens
+                    if any(
+                        (
+                            sequence_overlap(tokens, sequence)
+                            for sequence in stop_id_sequences
+                        )
+                    ):
+                        continue
+                    elif segment or tool_calls:
+                        response = self.generate_response(
+                            segment, None, tool_calls=tool_calls
+                        )
+                        self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
+                        self.wfile.flush()
+                        segment = ""
+                        tool_calls = []
+
+            # Get the final finish reason from context
+            if ctx.finish_reason is not None:
+                finish_reason = ctx.finish_reason
+
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            # Client disconnected, cancel the request
+            logging.info(f"Client disconnected, canceling request {uid}")
+            self.batch_worker.cancel(uid)
+            return
+
+        # Send final response
+        if self.stream:
+            response = self.generate_response(
+                segment, finish_reason, tool_calls=tool_calls
+            )
+            self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
+            self.wfile.flush()
+            if self.stream_options is not None and self.stream_options["include_usage"]:
+                response = self.completion_usage_response(len(prompt), len(tokens))
+                self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
+                self.wfile.flush()
+            self.wfile.write("data: [DONE]\n\n".encode())
+            self.wfile.flush()
+        else:
+            response = self.generate_response(
+                text,
+                finish_reason,
+                len(prompt),
+                len(tokens),
+                token_logprobs=token_logprobs,
+                top_tokens=top_tokens,
+                tokens=tokens,
+                tool_calls=tool_calls,
+            )
+            response_json = json.dumps(response).encode()
+            indent = "\t"  # Backslashes can't be inside of f-strings
+            logging.debug(f"Outgoing Response: {json.dumps(response, indent=indent)}")
+
+            # Send an additional Content-Length header when it is known
+            self.send_header("Content-Length", str(len(response_json)))
+            self.end_headers()
+            self.wfile.write(response_json)
+            self.wfile.flush()
+
     def completion_usage_response(
         self,
         prompt_token_count: Optional[int] = None,
@@ -953,6 +1225,7 @@ def run(
     model_provider: ModelProvider,
     server_class=HTTPServer,
     handler_class=APIHandler,
+    batch_worker: Optional[BatchWorker] = None,
 ):
     server_address = (host, port)
     prompt_cache = PromptCache()
@@ -966,6 +1239,7 @@ def run(
             model_provider,
             prompt_cache=prompt_cache,
             system_fingerprint=get_system_fingerprint(),
+            batch_worker=batch_worker,
             *args,
             **kwargs,
         ),
@@ -975,6 +1249,11 @@ def run(
         "it only implements basic security checks."
     )
     logging.info(f"Starting httpd at {host} on port {port}...")
+    if batch_worker is not None:
+        logging.info(
+            f"Batched mode enabled (completion_batch_size={batch_worker.gen.completion_batch_size}, "
+            f"prefill_batch_size={batch_worker.gen.prefill_batch_size})"
+        )
     httpd.serve_forever()
 
 
@@ -1074,13 +1353,65 @@ def main():
         help="""A JSON formatted string of arguments for the tokenizer's apply_chat_template, e.g. '{"enable_thinking":false}'""",
         default="{}",
     )
+    parser.add_argument(
+        "--batched",
+        action="store_true",
+        help="Enable batched serving mode for concurrent requests",
+    )
+    parser.add_argument(
+        "--completion-batch-size",
+        type=int,
+        default=32,
+        help="Maximum concurrent decoding batch size (default: 32)",
+    )
+    parser.add_argument(
+        "--prefill-batch-size",
+        type=int,
+        default=8,
+        help="Maximum prompts to prefill when capacity is available (default: 8)",
+    )
+    parser.add_argument(
+        "--prefill-step-size",
+        type=int,
+        default=2048,
+        help="Chunk size for long prompt prefill (default: 2048)",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper(), None),
         format="%(asctime)s - %(levelname)s - %(message)s",
     )
-    run(args.host, args.port, ModelProvider(args))
+
+    # Create batch worker if batched mode is enabled
+    batch_worker = None
+    if args.batched:
+        model_provider = ModelProvider(args)
+        model, tokenizer = model_provider.load(
+            args.model or "default_model", args.adapter_path, "default_model"
+        )
+
+        # Create sampler from default arguments
+        sampler = make_sampler(
+            args.temp,
+            top_p=args.top_p,
+            top_k=args.top_k,
+            min_p=args.min_p,
+        )
+
+        batch_worker = BatchWorker(
+            model=model,
+            tokenizer=tokenizer,
+            sampler=sampler,
+            completion_batch_size=args.completion_batch_size,
+            prefill_batch_size=args.prefill_batch_size,
+            prefill_step_size=args.prefill_step_size,
+        )
+        batch_worker.start()
+
+        run(args.host, args.port, model_provider, batch_worker=batch_worker)
+    else:
+        run(args.host, args.port, ModelProvider(args))
 
 
 if __name__ == "__main__":
